@@ -3,11 +3,14 @@
 穗粒尺寸测量脚本
 
 读取 fused_colored_pointcloud_final.txt（格式: X Y Z Ins Sem），
-每个 Ins 对应一个穗粒。通过长方体框选（AABB）计算粒长、粒宽、粒高，
-框选前剔除偏离中心过远的散点；宽高比（粒宽/粒高）越接近 1 越圆润。
-对全体穗粒的 |宽高比-1| 做 Z-score 归一化，明显偏离 1 的记为非结实；
-粒长低于全体粒长均值指定比例的也记为非结实，
-导出 Excel 及带 Survival_rate 的 TXT 文件。
+每个 Ins 对应一个穗粒。用 fit_percentile_ellipsoid（PCA + 2.5%–97.5% 分位）
+拟合罩住大部分点的椭球，再取轴向包络边长为粒长/粒宽/粒高（不显式剔除离散点）。
+视频展示与测量共用同一套椭球逻辑，再以外接方框框住该椭球。
+宽高比越接近 1 越圆润。
+对全体穗粒的 |宽高比-1| 做 Z-score 归一化；
+结实条件：Z-score <= 阈值视为结实；
+若 Z-score > 阈值，则最短边大于全体最短边均值时仍视为结实，否则不结实。
+导出 Excel 及带 Survival_rate 的 TXT 文件（TXT 保留全部原始点）。
 """
 
 import argparse
@@ -29,14 +32,72 @@ def load_pointcloud_txt(txt_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return points, instance_ids, sem
 
 
+def _knn_mean_distances(points: np.ndarray, k: int) -> np.ndarray:
+    """计算每个点到其 k 个最近邻的平均距离。"""
+    n = len(points)
+    if n <= 1:
+        return np.zeros(n, dtype=np.float64)
+
+    k_eff = max(1, min(k, n - 1))
+    # 点数较少时直接用全距离矩阵；较大时分块，避免内存暴涨
+    if n <= 4000:
+        diff = points[:, None, :] - points[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=2))
+        np.fill_diagonal(dist, np.inf)
+        knn = np.partition(dist, k_eff, axis=1)[:, :k_eff]
+        return knn.mean(axis=1)
+
+    mean_dists = np.empty(n, dtype=np.float64)
+    chunk = 512
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        diff = points[start:end, None, :] - points[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=2))
+        for i, global_i in enumerate(range(start, end)):
+            dist[i, global_i] = np.inf
+        knn = np.partition(dist, k_eff, axis=1)[:, :k_eff]
+        mean_dists[start:end] = knn.mean(axis=1)
+    return mean_dists
+
+
+def filter_statistical_outliers(
+    points: np.ndarray,
+    knn_k: int = 20,
+    std_ratio: float = 2.0,
+) -> np.ndarray:
+    """
+    统计离散点过滤（类似 Point Cloud Statistical Outlier Removal）：
+    若某点到 k 近邻的平均距离 > 全体均值 + std_ratio * 标准差，则剔除。
+    返回布尔掩码（True=保留）。
+    """
+    n = len(points)
+    if n < 3:
+        return np.ones(n, dtype=bool)
+
+    mean_dists = _knn_mean_distances(points, knn_k)
+    global_mean = float(mean_dists.mean())
+    global_std = float(mean_dists.std())
+    threshold = global_mean + std_ratio * global_std
+    inlier_mask = mean_dists <= threshold
+
+    if not np.any(inlier_mask):
+        keep_count = max(1, n // 2)
+        nearest_indices = np.argsort(mean_dists)[:keep_count]
+        inlier_mask = np.zeros(n, dtype=bool)
+        inlier_mask[nearest_indices] = True
+
+    return inlier_mask
+
+
 def filter_center_outliers(
     points: np.ndarray,
     distance_percentile: float = 95.0,
     std_ratio: float = 2.0,
 ) -> np.ndarray:
-    """剔除偏离质心过远的散点，返回有效点。"""
-    if len(points) == 0:
-        return points
+    """剔除偏离质心过远的散点，返回布尔掩码（True=保留）。"""
+    n = len(points)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
 
     centroid = points.mean(axis=0)
     distances = np.linalg.norm(points - centroid, axis=1)
@@ -47,12 +108,31 @@ def filter_center_outliers(
 
     inlier_mask = distances <= threshold
     if not np.any(inlier_mask):
-        keep_count = max(1, len(points) // 2)
+        keep_count = max(1, n // 2)
         nearest_indices = np.argsort(distances)[:keep_count]
-        inlier_mask = np.zeros(len(points), dtype=bool)
+        inlier_mask = np.zeros(n, dtype=bool)
         inlier_mask[nearest_indices] = True
 
-    return points[inlier_mask]
+    return inlier_mask
+
+
+def filter_discrete_points(
+    points: np.ndarray,
+    knn_k: int = 20,
+    statistical_std_ratio: float = 2.0,
+    distance_percentile: float = 95.0,
+    center_std_ratio: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    离散点过滤（已关闭）：椭球拟合直接使用全部点，不剔除。
+    返回 (点云, 全 True 掩码, 原始点数, 剔除点数=0)。
+    """
+    del knn_k, statistical_std_ratio, distance_percentile, center_std_ratio
+    original_count = len(points)
+    if original_count == 0:
+        return points, np.zeros(0, dtype=bool), 0, 0
+    keep_mask = np.ones(original_count, dtype=bool)
+    return points, keep_mask, original_count, 0
 
 
 def compute_bbox_dimensions(points: np.ndarray) -> tuple[float, float, float]:
@@ -61,6 +141,80 @@ def compute_bbox_dimensions(points: np.ndarray) -> tuple[float, float, float]:
         return 0.0, 0.0, 0.0
 
     extents = points.max(axis=0) - points.min(axis=0)
+    sorted_extents = np.sort(extents)[::-1]
+    return float(sorted_extents[0]), float(sorted_extents[1]), float(sorted_extents[2])
+
+
+def fit_percentile_ellipsoid(
+    points: np.ndarray,
+    low_percentile: float = 2.5,
+    high_percentile: float = 97.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """
+    椭球拟合（测量与视频共用）：
+    1) PCA 定三主轴；
+    2) 各轴投影取 [low, high] 百分位，得到罩住大部分点的轴向包络；
+    3) 该包络即为椭球的轴向半轴范围，外接方框 = 该 mins/maxs。
+
+    返回 (质心, 主轴3x3, 局部mins, 局部maxs)；点数不足或退化时返回 None。
+    """
+    if len(points) < 3:
+        return None
+
+    center = points.mean(axis=0)
+    centered = points - center
+    cov = np.cov(centered.T)
+    if not np.isfinite(cov).all() or abs(float(np.linalg.det(cov))) < 1e-18:
+        return None
+
+    _eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    order = np.argsort(_eigenvalues)[::-1]
+    axes = eigenvectors[:, order]
+    if np.linalg.det(axes) < 0:
+        axes[:, -1] *= -1
+
+    local = centered @ axes
+    if len(points) < 20:
+        mins = local.min(axis=0)
+        maxs = local.max(axis=0)
+    else:
+        low = float(np.clip(low_percentile, 0.0, 49.0))
+        high = float(np.clip(high_percentile, 51.0, 100.0))
+        if high <= low:
+            low, high = 2.5, 97.5
+        mins = np.percentile(local, low, axis=0)
+        maxs = np.percentile(local, high, axis=0)
+
+    return (
+        center.astype(np.float64),
+        axes.astype(np.float64),
+        np.asarray(mins, dtype=np.float64),
+        np.asarray(maxs, dtype=np.float64),
+    )
+
+
+def compute_ellipsoid_dimensions(
+    points: np.ndarray,
+    low_percentile: float = 2.5,
+    high_percentile: float = 97.5,
+) -> tuple[float, float, float]:
+    """
+    对点云做三维椭球拟合，返回 (粒长, 粒宽, 粒高)，按从大到小排序。
+    与视频展示共用 fit_percentile_ellipsoid：椭球罩大部分点，尺寸=轴向包络边长。
+    """
+    if len(points) == 0:
+        return 0.0, 0.0, 0.0
+
+    fitted = fit_percentile_ellipsoid(
+        points,
+        low_percentile=low_percentile,
+        high_percentile=high_percentile,
+    )
+    if fitted is None:
+        return compute_bbox_dimensions(points)
+
+    _center, _axes, mins, maxs = fitted
+    extents = maxs - mins
     sorted_extents = np.sort(extents)[::-1]
     return float(sorted_extents[0]), float(sorted_extents[1]), float(sorted_extents[2])
 
@@ -91,92 +245,128 @@ def normalize_deviations_zscore(deviations: list[float]) -> tuple[list[float], f
 
 
 def is_grain_firm_by_deviation(normalized_deviation: float, z_threshold: float = 1.5) -> bool:
-    """宽高比偏离度 Z-score <= 阈值时为结实。"""
+    """宽高比偏离度 Z-score <= 阈值时通过形状条件。"""
     return normalized_deviation <= z_threshold
 
 
-def is_grain_firm_by_length(
-    length: float,
-    mean_length: float,
-    min_length_ratio: float = 0.4,
+def is_grain_firm_by_shortest(
+    shortest: float,
+    mean_shortest: float,
 ) -> bool:
-    """粒长 >= 全体粒长均值 × 比例阈值时为结实，否则为过短非结实。"""
-    if mean_length <= 0:
-        return length > 0
-    return length >= min_length_ratio * mean_length
+    """最短边 > 全体最短边均值时通过最短边条件。"""
+    if mean_shortest <= 0:
+        return shortest > 0
+    return shortest > mean_shortest
 
 
 def is_grain_firm(
     normalized_deviation: float,
-    length: float,
-    mean_length: float,
+    shortest: float,
+    mean_shortest: float,
     deviation_z_threshold: float = 1.5,
-    min_length_ratio: float = 0.4,
 ) -> tuple[bool, str]:
-    """综合判定穗粒是否结实，返回 (是否结实, 判定说明)。"""
-    firm_by_shape = is_grain_firm_by_deviation(normalized_deviation, deviation_z_threshold)
-    firm_by_length = is_grain_firm_by_length(length, mean_length, min_length_ratio)
-
-    if firm_by_shape and firm_by_length:
+    """
+    结实判定：
+    - Z-score <= 阈值 → 结实
+    - Z-score > 阈值 且 最短边 > 全体最短边均值 → 结实
+    - Z-score > 阈值 且 最短边 <= 全体最短边均值 → 不结实
+    """
+    if normalized_deviation <= deviation_z_threshold:
         return True, "结实"
-    reasons = []
-    if not firm_by_shape:
-        reasons.append("宽高比偏离")
-    if not firm_by_length:
-        reasons.append("粒长过短")
-    return False, "、".join(reasons)
+
+    # Z-score 偏大：用最短边做二次判定
+    if mean_shortest <= 0:
+        firm_by_shortest = shortest > 0
+    else:
+        firm_by_shortest = shortest > mean_shortest
+
+    if firm_by_shortest:
+        return True, "结实(最短边偏大)"
+    return False, "宽高比偏离且最短边偏短"
 
 
 def measure_all_grains(
     points: np.ndarray,
     instance_ids: np.ndarray,
+    sem: np.ndarray,
     distance_percentile: float = 95.0,
     std_ratio: float = 2.0,
+    knn_k: int = 20,
+    statistical_std_ratio: float = 2.0,
     deviation_z_threshold: float = 1.5,
-    min_length_ratio: float = 0.4,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, int]]:
-    """测量所有穗粒，返回逐粒明细、汇总表、实例 Survival_rate 映射。"""
+    extent_low_percentile: float = 2.5,
+    extent_high_percentile: float = 97.5,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, int], np.ndarray, np.ndarray, np.ndarray]:
+    """
+    测量所有穗粒（椭球拟合 + 百分位轴向包络），再判定结实。
+    结实条件：Z-score<=阈值；或 Z-score>阈值 但最短边>全体最短边均值。
+    """
     unique_ids = np.sort(np.unique(instance_ids))
     grain_records: list[dict] = []
+    total_removed = 0
+    global_keep_mask = np.zeros(len(points), dtype=bool)
 
+    print(
+        f"离散点过滤已关闭：椭球拟合用全部点，"
+        f"轴向尺寸取 {extent_low_percentile:g}%–{extent_high_percentile:g}% 分位跨度..."
+    )
     for idx, ins_id in enumerate(unique_ids, start=1):
-        inst_points = points[instance_ids == ins_id]
-        filtered_points = filter_center_outliers(
+        inst_mask = instance_ids == ins_id
+        inst_indices = np.flatnonzero(inst_mask)
+        inst_points = points[inst_indices]
+        filtered_points, local_keep_mask, original_count, removed_count = filter_discrete_points(
             inst_points,
+            knn_k=knn_k,
+            statistical_std_ratio=statistical_std_ratio,
             distance_percentile=distance_percentile,
-            std_ratio=std_ratio,
+            center_std_ratio=std_ratio,
         )
-        length, width, height = compute_bbox_dimensions(filtered_points)
+        global_keep_mask[inst_indices[local_keep_mask]] = True
+        total_removed += removed_count
+
+        length, width, height = compute_ellipsoid_dimensions(
+            filtered_points,
+            low_percentile=extent_low_percentile,
+            high_percentile=extent_high_percentile,
+        )
+        shortest = min(length, width, height)
         wh_ratio = compute_width_height_ratio(width, height)
         deviation = compute_deviation_from_one(wh_ratio)
 
         grain_records.append({
             "序号": idx,
             "实例ID": int(ins_id),
+            "原始点数": original_count,
+            "有效点数": len(filtered_points),
+            "剔除点数": removed_count,
             "粒长": round(length, 4),
             "粒宽": round(width, 4),
             "粒高": round(height, 4),
+            "最短边": round(shortest, 4),
             "长宽比": round(length / width, 3) if width > 0 else 0.0,
             "长高比": round(length / height, 3) if height > 0 else 0.0,
             "宽高比": round(wh_ratio, 3),
             "偏离度": round(deviation, 4),
         })
 
+        if idx % 10 == 0 or idx == len(unique_ids):
+            print(f"  已处理 {idx}/{len(unique_ids)} 个实例")
+
+    print(f"测量完成，保留全部 {int(global_keep_mask.sum())} 个点（未剔除散点）")
+
     deviations = [g["偏离度"] for g in grain_records]
-    lengths = [g["粒长"] for g in grain_records]
+    shortest_list = [g["最短边"] for g in grain_records]
     z_scores, mean_dev, std_dev = normalize_deviations_zscore(deviations)
-    mean_length = float(np.mean(lengths)) if lengths else 0.0
-    length_threshold = mean_length * min_length_ratio
+    mean_shortest = float(np.mean(shortest_list)) if shortest_list else 0.0
 
     rows = []
     survival_map: dict[int, int] = {}
     for record, z_score in zip(grain_records, z_scores):
         is_firm, reason = is_grain_firm(
             z_score,
-            record["粒长"],
-            mean_length,
+            record["最短边"],
+            mean_shortest,
             deviation_z_threshold,
-            min_length_ratio,
         )
         survival = 1 if is_firm else 0
         survival_map[record["实例ID"]] = survival
@@ -184,7 +374,9 @@ def measure_all_grains(
         row = {k: v for k, v in record.items() if k != "实例ID"}
         row["归一化偏离度"] = round(z_score, 3)
         row["圆润度"] = round(1.0 / (1.0 + record["偏离度"]), 3)
-        row["粒长/均值"] = round(record["粒长"] / mean_length, 3) if mean_length > 0 else 0.0
+        row["最短边/均值"] = (
+            round(record["最短边"] / mean_shortest, 3) if mean_shortest > 0 else 0.0
+        )
         row["是否结实"] = "是" if is_firm else "否"
         row["判定说明"] = reason
         rows.append(row)
@@ -195,11 +387,13 @@ def measure_all_grains(
         mean_dev,
         std_dev,
         deviation_z_threshold,
-        mean_length,
-        min_length_ratio,
-        length_threshold,
+        mean_shortest,
+        total_removed,
     )
-    return detail_df, summary_df, survival_map
+    filtered_points = points[global_keep_mask]
+    filtered_instance_ids = instance_ids[global_keep_mask]
+    filtered_sem = sem[global_keep_mask]
+    return detail_df, summary_df, survival_map, filtered_points, filtered_instance_ids, filtered_sem
 
 
 def build_summary_df(
@@ -207,9 +401,8 @@ def build_summary_df(
     mean_deviation: float,
     std_deviation: float,
     deviation_z_threshold: float,
-    mean_length: float,
-    min_length_ratio: float,
-    length_threshold: float,
+    mean_shortest: float,
+    total_removed_points: int = 0,
 ) -> pd.DataFrame:
     """构建汇总表：总粒数、结实粒数、结实率。"""
     total = len(detail_df)
@@ -220,13 +413,15 @@ def build_summary_df(
         {"指标": "总粒数", "数值": total},
         {"指标": "结实粒数", "数值": firm_count},
         {"指标": "结实率(%)", "数值": firm_rate},
+        {"指标": "离散点剔除总数", "数值": total_removed_points},
         {"指标": "偏离度均值", "数值": round(mean_deviation, 4)},
         {"指标": "偏离度标准差", "数值": round(std_deviation, 4)},
         {"指标": "归一化偏离阈值", "数值": deviation_z_threshold},
-        {"指标": "粒长均值", "数值": round(mean_length, 4)},
-        {"指标": "粒长比例阈值", "数值": min_length_ratio},
-        {"指标": "粒长判定阈值", "数值": round(length_threshold, 4)},
-        {"指标": "结实判定条件", "数值": f"Z-score<={deviation_z_threshold} 且 粒长>={round(length_threshold, 4)}"},
+        {"指标": "最短边均值", "数值": round(mean_shortest, 4)},
+        {"指标": "结实判定条件", "数值": (
+            f"Z-score<={deviation_z_threshold} 视为结实；"
+            f"Z-score>{deviation_z_threshold} 时若最短边>{round(mean_shortest, 4)} 仍结实，否则不结实"
+        )},
     ])
 
 
@@ -264,13 +459,14 @@ def save_survival_txt(
     survival_map: dict[int, int],
     overall_survival_rate: float,
 ) -> None:
-    """导出带 Survival_rate 的点云 TXT（结实=1，不结实=0）。"""
+    """导出过滤后的点云 Survival TXT（结实=1，不结实=0）。"""
     txt_path = Path(txt_path)
     temp_path = txt_path.with_suffix(txt_path.suffix + ".tmp")
 
     with open(temp_path, "w", encoding="utf-8") as f:
         f.write("// X Y Z Ins Sem Survival_rate\n")
         f.write(f"// Overall_Survival_rate: {overall_survival_rate:.4f}\n")
+        f.write(f"// Filtered_point_count: {len(points)}\n")
         for i in range(len(points)):
             ins_id = int(instance_ids[i])
             survival = survival_map.get(ins_id, 0)
@@ -280,7 +476,7 @@ def save_survival_txt(
             )
 
     atomic_replace(temp_path, txt_path, "文件")
-    print(f"Survival TXT 已保存: {txt_path}")
+    print(f"Survival TXT 已保存: {txt_path}（过滤后 {len(points)} 个点）")
 
 
 def save_excel(detail_df: pd.DataFrame, summary_df: pd.DataFrame, excel_path: str) -> None:
@@ -310,38 +506,51 @@ def print_summary(summary_df: pd.DataFrame) -> None:
     print(f"总粒数: {int(summary['总粒数'])}")
     print(f"结实粒数: {int(summary['结实粒数'])}")
     print(f"结实率: {summary['结实率(%)']}%")
+    if "离散点剔除总数" in summary:
+        print(f"离散点剔除总数: {int(summary['离散点剔除总数'])}")
     print(f"偏离度均值: {summary['偏离度均值']}")
     print(f"偏离度标准差: {summary['偏离度标准差']}")
     print(f"归一化偏离阈值: {summary['归一化偏离阈值']}")
-    print(f"粒长均值: {summary['粒长均值']}")
-    print(f"粒长比例阈值: {summary['粒长比例阈值']}")
-    print(f"粒长判定阈值: {summary['粒长判定阈值']}")
+    print(f"最短边均值: {summary['最短边均值']}")
     print(f"结实判定条件: {summary['结实判定条件']}")
     print("=" * 48)
 
 
 def main():
     default_input = (
-        r"E:\rice\hhy-0402-1\hhy-0402-1_psnppcuda.txt"
+        r"E:\rice\ply\013\fused_colored_pointcloud_final.txt"
     )
 
     parser = argparse.ArgumentParser(description="穗粒尺寸测量与结实率评估，导出 Excel")
     parser.add_argument("--input_txt", type=str, default=default_input, help="输入点云 TXT 文件")
     parser.add_argument("--output_excel", type=str, default=None, help="输出 Excel 路径")
     parser.add_argument("--output_txt", type=str, default=None, help="输出 Survival_rate TXT 路径")
-    parser.add_argument("--distance_percentile", type=float, default=95.0, help="散点过滤百分位阈值")
-    parser.add_argument("--std_ratio", type=float, default=2.0, help="散点过滤标准差倍数")
+    parser.add_argument("--distance_percentile", type=float, default=95.0, help="质心散点过滤百分位阈值")
+    parser.add_argument("--std_ratio", type=float, default=2.0, help="质心散点过滤标准差倍数")
+    parser.add_argument("--knn_k", type=int, default=20, help="离散点过滤的近邻数 K")
+    parser.add_argument(
+        "--statistical_std_ratio",
+        type=float,
+        default=2.0,
+        help="KNN 统计离散点过滤的标准差倍数",
+    )
     parser.add_argument(
         "--deviation_z_threshold",
         type=float,
-        default=1.5,
+        default=1.4,
         help="宽高比偏离度的 Z-score 阈值，超过则判定为非结实（默认 1.5）",
     )
     parser.add_argument(
-        "--min_length_ratio",
+        "--extent_low_percentile",
         type=float,
-        default=0.4,
-        help="粒长低于全体粒长均值 × 该比例时判定为非结实（默认 0.4）",
+        default=2.5,
+        help="椭球轴向尺寸下百分位（默认 2.5，与高百分位组成分位包络）",
+    )
+    parser.add_argument(
+        "--extent_high_percentile",
+        type=float,
+        default=97.5,
+        help="椭球轴向尺寸上百分位（默认 97.5）",
     )
     args = parser.parse_args()
 
@@ -353,13 +562,24 @@ def main():
     )
 
     points, instance_ids, sem = load_pointcloud_txt(str(input_path))
-    detail_df, summary_df, survival_map = measure_all_grains(
+    (
+        detail_df,
+        summary_df,
+        survival_map,
+        filtered_points,
+        filtered_instance_ids,
+        filtered_sem,
+    ) = measure_all_grains(
         points,
         instance_ids,
+        sem,
         distance_percentile=args.distance_percentile,
         std_ratio=args.std_ratio,
+        knn_k=args.knn_k,
+        statistical_std_ratio=args.statistical_std_ratio,
         deviation_z_threshold=args.deviation_z_threshold,
-        min_length_ratio=args.min_length_ratio,
+        extent_low_percentile=args.extent_low_percentile,
+        extent_high_percentile=args.extent_high_percentile,
     )
 
     summary = dict(zip(summary_df["指标"], summary_df["数值"]))
@@ -368,9 +588,9 @@ def main():
     save_excel(detail_df, summary_df, str(output_excel))
     save_survival_txt(
         str(output_txt),
-        points,
-        instance_ids,
-        sem,
+        filtered_points,
+        filtered_instance_ids,
+        filtered_sem,
         survival_map,
         overall_survival_rate,
     )

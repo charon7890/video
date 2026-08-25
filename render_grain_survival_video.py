@@ -17,10 +17,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from compute_grain_dimensions import (
-    compute_bbox_dimensions,
     compute_deviation_from_one,
+    compute_ellipsoid_dimensions,
     compute_width_height_ratio,
-    filter_center_outliers,
+    fit_percentile_ellipsoid,
 )
 
 
@@ -39,19 +39,12 @@ def load_survival_txt(txt_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray
 def compute_all_roundness_scores(
     points: np.ndarray,
     instance_ids: np.ndarray,
-    distance_percentile: float = 95.0,
-    std_ratio: float = 2.0,
 ) -> dict[int, float]:
-    """计算每个实例的圆润度（宽高比越接近 1 越高）。"""
+    """椭球拟合后计算圆润度（宽高比越接近 1 越高），不剔除离散点。"""
     score_map: dict[int, float] = {}
     for ins_id in np.unique(instance_ids):
         inst_points = points[instance_ids == ins_id]
-        filtered = filter_center_outliers(
-            inst_points,
-            distance_percentile=distance_percentile,
-            std_ratio=std_ratio,
-        )
-        _length, width, height = compute_bbox_dimensions(filtered)
+        _length, width, height = compute_ellipsoid_dimensions(inst_points)
         wh_ratio = compute_width_height_ratio(width, height)
         deviation = compute_deviation_from_one(wh_ratio)
         score_map[int(ins_id)] = 1.0 / (1.0 + deviation)
@@ -66,42 +59,152 @@ def get_instance_survival(instance_ids: np.ndarray, survival: np.ndarray) -> dic
     return surv_map
 
 
+def compute_axis_extent(
+    points: np.ndarray,
+    center: np.ndarray,
+    axis: np.ndarray,
+) -> tuple[float, float]:
+    """全体点沿长轴投影的 [min, max]。"""
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    all_proj = (points - center) @ axis
+    return float(all_proj.min()), float(all_proj.max())
+
+
+def count_instances_near_tips(
+    heights: dict[int, float],
+    h_min: float,
+    h_max: float,
+    tip_ratio: float = 0.20,
+) -> tuple[list[int], list[int], float]:
+    """
+    统计靠近长轴两端「端处」的实例。
+    端处 = 从该端起 tip_ratio * 轴长 的区间。
+    返回 (高位端实例列表, 低位端实例列表, 端区长度)。
+    """
+    span = max(h_max - h_min, 1e-8)
+    tip_len = span * tip_ratio
+    high_tip_ids = [i for i, h in heights.items() if h >= h_max - tip_len]
+    low_tip_ids = [i for i, h in heights.items() if h <= h_min + tip_len]
+    return high_tip_ids, low_tip_ids, tip_len
+
+
+def orient_long_axis_dense_end_up(
+    points: np.ndarray,
+    instance_ids: np.ndarray,
+    axis: np.ndarray,
+    tip_ratio: float = 0.20,
+) -> np.ndarray:
+    """
+    比较长轴两端「端处」附近的实例数，实例更多的一端为上端；
+    翻转长轴使该端指向 +axis（视野上方）。
+    """
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    center = points.mean(axis=0)
+    h_min, h_max = compute_axis_extent(points, center, axis)
+    centroids = compute_instance_centroids(points, instance_ids)
+    heights = {
+        int(ins_id): float(np.dot(centroids[ins_id] - center, axis))
+        for ins_id in centroids
+    }
+    high_tip_ids, low_tip_ids, tip_len = count_instances_near_tips(
+        heights, h_min, h_max, tip_ratio=tip_ratio,
+    )
+    high_count = len(high_tip_ids)
+    low_count = len(low_tip_ids)
+
+    if low_count > high_count:
+        axis = -axis
+        print(
+            f"视角定向: 端处实例 高位端 {high_count} / 低位端 {low_count} "
+            f"（端区长度={tip_len:.4f}），穗密端在低位，已翻转长轴使上端朝向视野上方"
+        )
+    else:
+        print(
+            f"视角定向: 端处实例 高位端 {high_count} / 低位端 {low_count} "
+            f"（端区长度={tip_len:.4f}），穗密端在高位，长轴已朝向视野上方"
+        )
+    return axis
+
+
 def select_firm_and_hollow_grains(
+    points: np.ndarray,
     instance_ids: np.ndarray,
     survival: np.ndarray,
     roundness_map: dict[int, float],
+    plant_long_axis: np.ndarray,
     n_each: int = 2,
-) -> tuple[list[int], list[float], list[int], list[float]]:
-    """实心=Survival_rate 1 中圆润度最高；空心=Survival_rate 0 中圆润度最低。"""
+    tip_ratio: float = 0.20,
+) -> tuple[list[int], list[float], list[int], list[float], list[str], list[str]]:
+    """
+    左侧结实 / 右侧非结实：均在穗密上端处选取靠近端处的 n_each 颗。
+    """
     surv_map = get_instance_survival(instance_ids, survival)
+    center = points.mean(axis=0)
+    axis = plant_long_axis / (np.linalg.norm(plant_long_axis) + 1e-12)
+    centroids = compute_instance_centroids(points, instance_ids)
 
-    firm_candidates = [(i, roundness_map[i]) for i in surv_map if surv_map[i] == 1 and i in roundness_map]
-    hollow_candidates = [(i, roundness_map[i]) for i in surv_map if surv_map[i] == 0 and i in roundness_map]
-    firm_candidates.sort(key=lambda x: x[1], reverse=True)
-    hollow_candidates.sort(key=lambda x: x[1])
+    heights: dict[int, float] = {
+        int(ins_id): float(np.dot(centroids[ins_id] - center, axis))
+        for ins_id in centroids
+    }
+    h_min, h_max = compute_axis_extent(points, center, axis)
+    high_tip_ids, low_tip_ids, tip_len = count_instances_near_tips(
+        heights, h_min, h_max, tip_ratio=tip_ratio,
+    )
+    tip_ids = high_tip_ids
+    tip_score = {i: h - (h_max - tip_len) for i, h in heights.items()}
 
-    if len(firm_candidates) < n_each:
-        raise ValueError(f"饱满稻穗不足 {n_each} 颗（当前 {len(firm_candidates)} 颗）")
-    if len(hollow_candidates) < n_each:
-        all_sorted = sorted(roundness_map.items(), key=lambda x: x[1])
-        hollow_candidates = all_sorted[:n_each]
-        print(f"警告：不饱满稻穗不足 {n_each} 颗，改选圆润度最低的 {n_each} 颗")
+    print(
+        f"上端判定: 高位端处（已定向为视野上方） | "
+        f"端区=[{h_max - tip_len:.4f}, {h_max:.4f}], "
+        f"上端处 {len(high_tip_ids)} 粒, 下端处 {len(low_tip_ids)} 粒"
+    )
 
-    top_items = firm_candidates[:n_each]
-    bottom_items = hollow_candidates[:n_each]
-    top_ids = [int(i) for i, _ in top_items]
-    top_scores = [float(v) for _, v in top_items]
-    bottom_ids = [int(i) for i, _ in bottom_items]
-    bottom_scores = [float(v) for _, v in bottom_items]
+    firm_all = [i for i in surv_map if surv_map[i] == 1 and i in roundness_map]
+    hollow_all = [i for i in surv_map if surv_map[i] == 0 and i in roundness_map]
 
-    print("选中的 2 颗饱满稻穗:")
-    for ins_id, score in zip(top_ids, top_scores):
-        print(f"  实例 #{ins_id}: 圆润度 = {score:.3f}")
-    print("选中的 2 颗不饱满稻穗:")
-    for ins_id, score in zip(bottom_ids, bottom_scores):
-        print(f"  实例 #{ins_id}: 圆润度 = {score:.3f}")
+    tip_id_set = set(tip_ids)
+    firm_pool = [i for i in firm_all if i in tip_id_set]
+    hollow_pool = [i for i in hollow_all if i in tip_id_set]
+    if len(firm_pool) < n_each:
+        print(f"警告：上端处结实穗仅 {len(firm_pool)} 颗，改为在全部结实穗中按靠近上端选取")
+        firm_pool = firm_all
+    if len(hollow_pool) < n_each:
+        print(f"警告：上端处非结实穗仅 {len(hollow_pool)} 颗，改为在全部非结实穗中按靠近上端选取")
+        hollow_pool = hollow_all
+    if len(firm_pool) < n_each:
+        raise ValueError(f"结实稻穗不足 {n_each} 颗（当前 {len(firm_pool)} 颗）")
+    if len(hollow_pool) < n_each:
+        raise ValueError(
+            f"非结实稻穗不足 {n_each} 颗（当前 {len(hollow_pool)} 颗），"
+            f"右边必须先从非结实中选取"
+        )
 
-    return top_ids, top_scores, bottom_ids, bottom_scores
+    def pick_near_tip(pool: list[int]) -> tuple[list[int], list[float], list[str]]:
+        ranked = sorted(pool, key=lambda i: tip_score[i], reverse=True)
+        chosen = [int(i) for i in ranked[:n_each]]
+        ids = sorted(chosen, key=lambda i: heights[i], reverse=True)
+        scores = [float(roundness_map[i]) for i in ids]
+        ends = ["top", "bottom"] if len(ids) >= 2 else ["top"] * len(ids)
+        return ids, scores, ends
+
+    firm_ids, firm_scores, firm_ends = pick_near_tip(firm_pool)
+    hollow_ids, hollow_scores, hollow_ends = pick_near_tip(hollow_pool)
+
+    print("选中的 2 颗结实稻穗（靠近穗密上端处）:")
+    for ins_id, score, end in zip(firm_ids, firm_scores, firm_ends):
+        print(
+            f"  实例 #{ins_id} [画面{end}]: 圆润度={score:.3f}, "
+            f"轴向高度={heights[ins_id]:.4f}"
+        )
+    print("选中的 2 颗非结实稻穗（靠近穗密上端处）:")
+    for ins_id, score, end in zip(hollow_ids, hollow_scores, hollow_ends):
+        print(
+            f"  实例 #{ins_id} [画面{end}]: 圆润度={score:.3f}, "
+            f"轴向高度={heights[ins_id]:.4f}"
+        )
+
+    return firm_ids, firm_scores, hollow_ids, hollow_scores, firm_ends, hollow_ends
 
 
 def build_showcase_items(
@@ -109,18 +212,28 @@ def build_showcase_items(
     firm_scores: list[float],
     hollow_ids: list[int],
     hollow_scores: list[float],
+    firm_ends: list[str],
+    hollow_ends: list[str],
 ) -> list[dict]:
-    """按饱满度（圆润度）从高到低排序，用于从左到右展示。"""
+    """左侧结实、右侧非结实；每侧按画面上→下排列。"""
     items = []
-    for ins_id, score in zip(firm_ids, firm_scores):
-        items.append({"id": int(ins_id), "score": float(score), "is_firm": True})
-    for ins_id, score in zip(hollow_ids, hollow_scores):
-        items.append({"id": int(ins_id), "score": float(score), "is_firm": False})
-    items.sort(key=lambda x: x["score"], reverse=True)
-    print("展示排列（饱满→植株左侧，不饱满→植株右侧）:")
-    for idx, item in enumerate(items):
-        label = "饱满" if item["is_firm"] else "不饱满"
-        print(f"  位置{idx + 1}: #{item['id']} {label} 圆润度={item['score']:.3f}")
+    for ins_id, score, end in zip(firm_ids, firm_scores, firm_ends):
+        items.append({"id": int(ins_id), "score": float(score), "is_firm": True, "end": end})
+    for ins_id, score, end in zip(hollow_ids, hollow_scores, hollow_ends):
+        items.append({"id": int(ins_id), "score": float(score), "is_firm": False, "end": end})
+
+    def sort_key(item: dict) -> tuple:
+        side = 0 if item["is_firm"] else 1
+        vert = 0 if item.get("end") == "top" else 1
+        return (side, vert)
+
+    items.sort(key=sort_key)
+    print("展示排列（左=结实靠近上端，右=非结实靠近上端）:")
+    for item in items:
+        label = "结实" if item["is_firm"] else "非结实"
+        side = "左" if item["is_firm"] else "右"
+        end = "上" if item.get("end") == "top" else "下"
+        print(f"  {side}{end}: #{item['id']} {label}")
     return items
 
 
@@ -129,6 +242,21 @@ def compute_instance_centroids(points: np.ndarray, instance_ids: np.ndarray) -> 
     for ins_id in np.unique(instance_ids):
         centroids[int(ins_id)] = points[instance_ids == ins_id].mean(axis=0)
     return centroids
+
+
+def assign_grain_target_positions(showcase_items: list[dict], width: int, height: int) -> list[tuple[int, int]]:
+    """饱满→左（上/下），不饱满→右（上/下）。"""
+    slot_map = {
+        ("firm", "top"): (int(width * 0.10), int(height * 0.32)),
+        ("firm", "bottom"): (int(width * 0.10), int(height * 0.68)),
+        ("hollow", "top"): (int(width * 0.90), int(height * 0.32)),
+        ("hollow", "bottom"): (int(width * 0.90), int(height * 0.68)),
+    }
+    targets: list[tuple[int, int]] = []
+    for item in showcase_items:
+        key = ("firm" if item["is_firm"] else "hollow", item.get("end", "top"))
+        targets.append(slot_map[key])
+    return targets
 
 
 def generate_distinct_colors(n: int) -> np.ndarray:
@@ -210,28 +338,6 @@ def subsample_indices(n: int, max_points: int, seed: int = 42) -> np.ndarray:
         return np.arange(n, dtype=np.int64)
     rng = np.random.default_rng(seed)
     return np.sort(rng.choice(n, size=max_points, replace=False))
-
-
-def assign_grain_target_positions(showcase_items: list[dict], width: int, height: int) -> list[tuple[int, int]]:
-    """饱满稻穗飞到植株左侧，不饱满稻穗飞到植株右侧。"""
-    firm_slots = [
-        (int(width * 0.10), int(height * 0.38)),
-        (int(width * 0.10), int(height * 0.62)),
-    ]
-    hollow_slots = [
-        (int(width * 0.90), int(height * 0.38)),
-        (int(width * 0.90), int(height * 0.62)),
-    ]
-    firm_i = hollow_i = 0
-    targets: list[tuple[int, int]] = []
-    for item in showcase_items:
-        if item["is_firm"]:
-            targets.append(firm_slots[firm_i])
-            firm_i += 1
-        else:
-            targets.append(hollow_slots[hollow_i])
-            hollow_i += 1
-    return targets
 
 
 def world_to_view_offset(world_offset: np.ndarray, view: np.ndarray) -> np.ndarray:
@@ -326,8 +432,10 @@ def draw_label(canvas: np.ndarray, text: str, position: tuple[int, int], color: 
 
 
 def grain_label_text(ins_id: int, is_firm: bool, score: float) -> str:
-    label = "饱满" if is_firm else "不饱满"
-    return f"#{ins_id} {label} 圆润度={score:.3f}"
+    # 画面不展示圆润度，仅保留结实/非结实
+    _ = score
+    label = "结实" if is_firm else "非结实"
+    return f"#{ins_id} {label}"
 
 
 def render_frame_full_plant_rotation(
@@ -362,13 +470,143 @@ def render_plant_background(
     u, v, depth = project_points(local, view, width, height, plant_scale)
     draw_points(canvas, u, v, depth, colors[bg_indices], point_radius, alpha=1.0)
 
+def compute_obb_params(
+    points: np.ndarray,
+    padding: float = 0.05,
+    flat_scale: float = 1.0,
+    low_percentile: float = 2.5,
+    high_percentile: float = 97.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    与测量相同的椭球拟合，再用轴向方框框住该椭球。
+    椭球 = fit_percentile_ellipsoid；方框 = 椭球轴向包络（可加 padding / 压扁最短轴）。
+    """
+    if len(points) < 3:
+        eye = np.eye(3, dtype=np.float64)
+        zeros = np.zeros(3, dtype=np.float64)
+        return zeros, eye, zeros, zeros
+
+    fitted = fit_percentile_ellipsoid(
+        points,
+        low_percentile=low_percentile,
+        high_percentile=high_percentile,
+    )
+    if fitted is None:
+        eye = np.eye(3, dtype=np.float64)
+        zeros = np.zeros(3, dtype=np.float64)
+        return zeros, eye, zeros, zeros
+
+    center, axes, mins, maxs = fitted
+    extents = np.maximum(maxs - mins, 1e-6)
+    mins = mins - extents * padding
+    maxs = maxs + extents * padding
+
+    flat = float(np.clip(flat_scale, 0.15, 1.0))
+    if flat < 1.0:
+        # 最短轴为 PCA 第 3 轴（特征值最小）
+        mid = 0.5 * (mins[2] + maxs[2])
+        half = 0.5 * (maxs[2] - mins[2]) * flat
+        mins[2] = mid - half
+        maxs[2] = mid + half
+
+    return center, axes, mins, maxs
+
+
+def compute_obb_corners(
+    points: np.ndarray,
+    padding: float = 0.05,
+    flat_scale: float = 1.0,
+) -> np.ndarray:
+    """椭球外接方框的 8 个角点（相对质心）。"""
+    center, axes, mins, maxs = compute_obb_params(points, padding, flat_scale)
+    if len(points) < 3:
+        return np.zeros((8, 3), dtype=np.float64)
+
+    local_corners = np.array([
+        [mins[0], mins[1], mins[2]],
+        [maxs[0], mins[1], mins[2]],
+        [maxs[0], maxs[1], mins[2]],
+        [mins[0], maxs[1], mins[2]],
+        [mins[0], mins[1], maxs[2]],
+        [maxs[0], mins[1], maxs[2]],
+        [maxs[0], maxs[1], maxs[2]],
+        [mins[0], maxs[1], maxs[2]],
+    ], dtype=np.float64)
+    return local_corners @ axes.T
+
+
+def clip_points_to_obb(
+    points: np.ndarray,
+    colors: np.ndarray,
+    padding: float = 0.05,
+    flat_scale: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """只保留椭球外接方框内的点，去掉框外离散点。"""
+    if len(points) < 3:
+        return points, colors
+
+    center, axes, mins, maxs = compute_obb_params(points, padding=padding, flat_scale=flat_scale)
+    local = (points - center) @ axes
+    inside = (
+        (local[:, 0] >= mins[0]) & (local[:, 0] <= maxs[0])
+        & (local[:, 1] >= mins[1]) & (local[:, 1] <= maxs[1])
+        & (local[:, 2] >= mins[2]) & (local[:, 2] <= maxs[2])
+    )
+    if not np.any(inside):
+        return points, colors
+    return points[inside], colors[inside]
+
+
+_AABB_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+
+
+def draw_bbox_wireframe(
+    canvas: np.ndarray,
+    corners_world: np.ndarray,
+    view: np.ndarray,
+    width: int,
+    height: int,
+    proj_scale: float,
+    color: tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    """将 3D 长方体 8 角点投影到画面并绘制 12 条边。"""
+    u, v, _ = project_points(corners_world, view, width, height, proj_scale)
+    h, w = canvas.shape[:2]
+    for i, j in _AABB_EDGES:
+        p1 = (int(u[i]), int(v[i]))
+        p2 = (int(u[j]), int(v[j]))
+        if (
+            (p1[0] < -50 and p2[0] < -50)
+            or (p1[0] > w + 50 and p2[0] > w + 50)
+            or (p1[1] < -50 and p2[1] < -50)
+            or (p1[1] > h + 50 and p2[1] > h + 50)
+        ):
+            continue
+        cv2.line(canvas, p1, p2, color, thickness, cv2.LINE_AA)
+
+
 def render_grain_showcase(
     canvas, grain_points, grain_colors, long_axis, center, spin_angle, view, width, height,
     tint, point_radius, target_screen_uv, move_progress, display_scale, proj_scale,
+    draw_bbox: bool = True, bbox_bgr: tuple[int, int, int] | None = None,
+    bbox_flat_scale: float = 1.0, clip_outside_bbox: bool = True,
 ):
-    """稻穗沿长轴旋转，并移动到画面上指定像素位置（视角中从左到右排开）。"""
-    grain_center = grain_points.mean(axis=0)
-    local = (grain_points - grain_center) @ rotation_matrix_axis(long_axis, spin_angle).T
+    """稻穗沿长轴旋转，并移动到画面指定位置；方形框贴合椭球分位包络，并裁掉框外点。"""
+    # 框与裁剪都基于完整点云的 PCA 百分位包络（不含极值飞点）
+    bbox_source_points = grain_points
+    if clip_outside_bbox:
+        grain_points, grain_colors = clip_points_to_obb(
+            grain_points, grain_colors, padding=0.05, flat_scale=bbox_flat_scale,
+        )
+
+    grain_center = bbox_source_points.mean(axis=0)
+    spin_rot = rotation_matrix_axis(long_axis, spin_angle)
+    local = (grain_points - grain_center) @ spin_rot.T
     local = local * display_scale
 
     start_view = world_to_view_offset(grain_center - center, view)
@@ -384,6 +622,19 @@ def render_grain_showcase(
     u, v, depth = project_points(world, view, width, height, proj_scale)
     tinted = np.clip(grain_colors.astype(np.float32) * 0.35 + tint * 0.65, 0, 255).astype(np.uint8)
     draw_points(canvas, u, v, depth, tinted, point_radius, alpha=1.0)
+
+    if draw_bbox and move_progress > 0.15:
+        corners_local = (
+            compute_obb_corners(bbox_source_points, padding=0.05, flat_scale=bbox_flat_scale)
+            @ spin_rot.T
+            * display_scale
+        )
+        corners_world = corners_local + center_offset
+        color = bbox_bgr if bbox_bgr is not None else (int(tint[2]), int(tint[1]), int(tint[0]))
+        draw_bbox_wireframe(
+            canvas, corners_world, view, width, height, proj_scale, color, thickness=2,
+        )
+
     return u, v
 
 
@@ -407,7 +658,7 @@ def render_frame_grains_scene(
     show_labels: bool = False,
     title: str | None = None,
 ):
-    """植株保持原视角，4 颗稻穗飞出/展示（仅放大稻穗本身）。"""
+    """植株保持原视角，4 颗稻穗飞出/展示（仅放大稻穗本身），并用长方体框选。"""
     canvas = np.full((height, width, 3), 18, dtype=np.uint8)
     view = get_view_matrix_perpendicular_to_axis(global_long_axis)
     render_plant_background(
@@ -422,17 +673,26 @@ def render_frame_grains_scene(
         score = item["score"]
         is_firm = item["is_firm"]
         tint = np.array([80, 220, 120], dtype=np.float32) if is_firm else np.array([240, 90, 70], dtype=np.float32)
+        bbox_bgr = (80, 230, 130) if is_firm else (90, 120, 255)  # BGR: 绿 / 红
+        # 不饱满：最短边压到 50%，并去掉长方体外部的点
+        bbox_flat = 1.0 if is_firm else 0.50
         mask = instance_ids == ins_id
         u, v = render_grain_showcase(
             canvas, points[mask], colors[mask], long_axes[ins_id], center, spin_angle,
             view, width, height, tint, highlight_radius,
             target_positions[idx], move_t, grain_scale, plant_scale,
+            draw_bbox=True, bbox_bgr=bbox_bgr, bbox_flat_scale=bbox_flat,
+            clip_outside_bbox=True,
         )
         if show_labels and move_t > 0.85 and len(u) > 0:
-            side = "左" if is_firm else "右"
+            side = "左上" if is_firm and item.get("end") == "top" else (
+                "左下" if is_firm else (
+                    "右上" if item.get("end") == "top" else "右下"
+                )
+            )
             draw_label(
                 canvas,
-                f"#{ins_id} {grain_label_text(ins_id, is_firm, score)} [{side}]",
+                f"{grain_label_text(ins_id, is_firm, score)} [{side}]",
                 (int(np.clip(u.mean() - 110, 24, width - 380)), int(np.clip(v.max() + 10, 30, height - 50))),
                 (80, 230, 130) if is_firm else (255, 120, 90),
                 font_size=18,
@@ -455,20 +715,21 @@ def render_video(
     max_render_points: int = 100000,
     point_radius: int = 1,
     highlight_point_radius: int = 2,
-    distance_percentile: float = 95.0,
-    std_ratio: float = 2.0,
 ):
     points, instance_ids, _sem, survival = load_survival_txt(input_txt)
     colors = build_instance_colors(instance_ids)
     center = points.mean(axis=0)
 
-    roundness_map = compute_all_roundness_scores(
-        points, instance_ids, distance_percentile=distance_percentile, std_ratio=std_ratio,
+    roundness_map = compute_all_roundness_scores(points, instance_ids)
+    global_long_axis = compute_long_axis(points[subsample_indices(len(points), min(30000, len(points)))])
+    # 保证穗密上端朝向 +axis，从而在视野中位于屏幕上方
+    global_long_axis = orient_long_axis_dense_end_up(points, instance_ids, global_long_axis)
+    firm_ids, firm_scores, hollow_ids, hollow_scores, firm_ends, hollow_ends = select_firm_and_hollow_grains(
+        points, instance_ids, survival, roundness_map, global_long_axis, n_each=2,
     )
-    firm_ids, firm_scores, hollow_ids, hollow_scores = select_firm_and_hollow_grains(
-        instance_ids, survival, roundness_map, n_each=2,
+    showcase_items = build_showcase_items(
+        firm_ids, firm_scores, hollow_ids, hollow_scores, firm_ends, hollow_ends,
     )
-    showcase_items = build_showcase_items(firm_ids, firm_scores, hollow_ids, hollow_scores)
     keep_ids = {item["id"] for item in showcase_items}
     keep_mask = np.isin(instance_ids, list(keep_ids))
     bg_indices = np.where(~keep_mask)[0]
@@ -476,7 +737,6 @@ def render_video(
     all_render_indices = subsample_indices(len(points), max_render_points)
 
     long_axes = compute_grain_long_axes(points, instance_ids, [item["id"] for item in showcase_items])
-    global_long_axis = compute_long_axis(points[subsample_indices(len(points), min(30000, len(points)))])
     view = get_view_matrix_perpendicular_to_axis(global_long_axis)
     plant_scale = compute_fit_scale(points - center, view, width, height, margin=0.90)
     target_positions = assign_grain_target_positions(showcase_items, width, height)
@@ -526,7 +786,7 @@ def render_video(
                 fly_progress=1.0, spin_angle=spin,
                 width=width, height=height, point_radius=point_radius,
                 highlight_radius=highlight_point_radius, plant_scale=plant_scale,
-                show_labels=True, title="饱满←植株→不饱满",
+                show_labels=False, title="结实←植株→非结实",
             )
         writer.write(canvas)
         if (frame_idx + 1) % 60 == 0 or frame_idx + 1 == total_frames:
@@ -539,8 +799,8 @@ def render_video(
 def main():
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="从 Survival TXT 生成稻穗爆炸展示视频")
-    parser.add_argument("--input_txt", type=str, default=str(root / "fused_colored_pointcloud_final_survival.txt"))
-    parser.add_argument("--output_video", type=str, default=str(root / "grain_explosion_video.mp4"))
+    parser.add_argument("--input_txt", type=str, default=str(r"E:\rice\ply\013\fused_colored_pointcloud_final_survival.txt"))
+    parser.add_argument("--output_video", type=str, default=str(r"E:\rice\ply\013\fused_colored_pointcloud_final_survival.mp4"))
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration", type=float, default=30.0)
     parser.add_argument("--phase1_ratio", type=float, default=0.25, help="整株旋转占比")
