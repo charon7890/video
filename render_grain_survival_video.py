@@ -20,18 +20,27 @@ from compute_grain_dimensions import (
     compute_deviation_from_one,
     compute_ellipsoid_dimensions,
     compute_width_height_ratio,
-    fit_percentile_ellipsoid,
+    fit_min_volume_ellipsoid,
 )
 
 
 def load_survival_txt(txt_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """加载带 Survival_rate 的点云 TXT。"""
+    """
+    加载 Survival TXT。
+    新格式: X Y Z R G B Ins Sem Survival_rate
+    旧格式: X Y Z Ins Sem Survival_rate
+    """
     print(f"正在加载点云: {txt_path}")
     data = np.loadtxt(txt_path, comments="//")
     points = data[:, :3]
-    instance_ids = data[:, 3].astype(np.int32)
-    sem = data[:, 4].astype(np.int32) if data.shape[1] > 4 else np.zeros(len(points), dtype=np.int32)
-    survival = data[:, 5].astype(np.int32) if data.shape[1] > 5 else np.zeros(len(points), dtype=np.int32)
+    if data.shape[1] >= 9:
+        instance_ids = data[:, 6].astype(np.int32)
+        sem = data[:, 7].astype(np.int32)
+        survival = data[:, 8].astype(np.int32)
+    else:
+        instance_ids = data[:, 3].astype(np.int32)
+        sem = data[:, 4].astype(np.int32) if data.shape[1] > 4 else np.zeros(len(points), dtype=np.int32)
+        survival = data[:, 5].astype(np.int32) if data.shape[1] > 5 else np.zeros(len(points), dtype=np.int32)
     print(f"已加载 {len(points)} 个点，{len(np.unique(instance_ids))} 个实例")
     return points, instance_ids, sem, survival
 
@@ -74,7 +83,7 @@ def count_instances_near_tips(
     heights: dict[int, float],
     h_min: float,
     h_max: float,
-    tip_ratio: float = 0.20,
+    tip_ratio: float = 0.10,
 ) -> tuple[list[int], list[int], float]:
     """
     统计靠近长轴两端「端处」的实例。
@@ -92,7 +101,7 @@ def orient_long_axis_dense_end_up(
     points: np.ndarray,
     instance_ids: np.ndarray,
     axis: np.ndarray,
-    tip_ratio: float = 0.20,
+    tip_ratio: float = 0.10,
 ) -> np.ndarray:
     """
     比较长轴两端「端处」附近的实例数，实例更多的一端为上端；
@@ -133,7 +142,7 @@ def select_firm_and_hollow_grains(
     roundness_map: dict[int, float],
     plant_long_axis: np.ndarray,
     n_each: int = 2,
-    tip_ratio: float = 0.20,
+    tip_ratio: float = 0.10,
 ) -> tuple[list[int], list[float], list[int], list[float], list[str], list[str]]:
     """
     左侧结实 / 右侧非结实：均在穗密上端处选取靠近端处的 n_each 颗。
@@ -474,23 +483,17 @@ def compute_obb_params(
     points: np.ndarray,
     padding: float = 0.05,
     flat_scale: float = 1.0,
-    low_percentile: float = 2.5,
-    high_percentile: float = 97.5,
+    coverage: float = 0.95,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    与测量相同的椭球拟合，再用轴向方框框住该椭球。
-    椭球 = fit_percentile_ellipsoid；方框 = 椭球轴向包络（可加 padding / 压扁最短轴）。
+    视频展示：一律用最小体积椭球（MVEE）框选，再以外接方框画出。
     """
     if len(points) < 3:
         eye = np.eye(3, dtype=np.float64)
         zeros = np.zeros(3, dtype=np.float64)
         return zeros, eye, zeros, zeros
 
-    fitted = fit_percentile_ellipsoid(
-        points,
-        low_percentile=low_percentile,
-        high_percentile=high_percentile,
-    )
+    fitted = fit_min_volume_ellipsoid(points, coverage=coverage)
     if fitted is None:
         eye = np.eye(3, dtype=np.float64)
         zeros = np.zeros(3, dtype=np.float64)
@@ -503,7 +506,7 @@ def compute_obb_params(
 
     flat = float(np.clip(flat_scale, 0.15, 1.0))
     if flat < 1.0:
-        # 最短轴为 PCA 第 3 轴（特征值最小）
+        # 最短轴为椭球第 3 主轴（半轴最短）
         mid = 0.5 * (mins[2] + maxs[2])
         half = 0.5 * (maxs[2] - mins[2]) * flat
         mins[2] = mid - half
@@ -517,7 +520,7 @@ def compute_obb_corners(
     padding: float = 0.05,
     flat_scale: float = 1.0,
 ) -> np.ndarray:
-    """椭球外接方框的 8 个角点（相对质心）。"""
+    """MVEE 外接方框的 8 个角点（相对质心）。"""
     center, axes, mins, maxs = compute_obb_params(points, padding, flat_scale)
     if len(points) < 3:
         return np.zeros((8, 3), dtype=np.float64)
@@ -596,8 +599,8 @@ def render_grain_showcase(
     draw_bbox: bool = True, bbox_bgr: tuple[int, int, int] | None = None,
     bbox_flat_scale: float = 1.0, clip_outside_bbox: bool = True,
 ):
-    """稻穗沿长轴旋转，并移动到画面指定位置；方形框贴合椭球分位包络，并裁掉框外点。"""
-    # 框与裁剪都基于完整点云的 PCA 百分位包络（不含极值飞点）
+    """稻穗沿长轴旋转；用 MVEE 外接方框框选，并裁掉框外点。"""
+    # 框与裁剪均基于最小体积椭球外接盒
     bbox_source_points = grain_points
     if clip_outside_bbox:
         grain_points, grain_colors = clip_points_to_obb(
@@ -674,8 +677,8 @@ def render_frame_grains_scene(
         is_firm = item["is_firm"]
         tint = np.array([80, 220, 120], dtype=np.float32) if is_firm else np.array([240, 90, 70], dtype=np.float32)
         bbox_bgr = (80, 230, 130) if is_firm else (90, 120, 255)  # BGR: 绿 / 红
-        # 不饱满：最短边压到 50%，并去掉长方体外部的点
-        bbox_flat = 1.0 if is_firm else 0.50
+        # 非结实：最短边压到原本的 80%，并去掉长方体外部的点
+        bbox_flat = 1.0 if is_firm else 0.80
         mask = instance_ids == ins_id
         u, v = render_grain_showcase(
             canvas, points[mask], colors[mask], long_axes[ins_id], center, spin_angle,
@@ -799,8 +802,8 @@ def render_video(
 def main():
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="从 Survival TXT 生成稻穗爆炸展示视频")
-    parser.add_argument("--input_txt", type=str, default=str(r"E:\rice\ply\013\fused_colored_pointcloud_final_survival.txt"))
-    parser.add_argument("--output_video", type=str, default=str(r"E:\rice\ply\013\fused_colored_pointcloud_final_survival.mp4"))
+    parser.add_argument("--input_txt", type=str, default=str(r"E:\rice\ply\007\fused_colored_pointcloud_final_survival.txt"))
+    parser.add_argument("--output_video", type=str, default=str(r"E:\rice\ply\007\fused_colored_pointcloud_final_survival.mp4"))
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration", type=float, default=30.0)
     parser.add_argument("--phase1_ratio", type=float, default=0.25, help="整株旋转占比")
